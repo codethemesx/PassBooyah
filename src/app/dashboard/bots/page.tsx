@@ -295,25 +295,6 @@ export default function BotsPage() {
     setSavingConfig(false);
   }
 
-  async function openConfig(bot: Bot) {
-    setEditingBot(bot);
-    setEditedConfig(bot.config || {});
-  }
-
-  async function saveBotConfig() {
-    if (!editingBot) return;
-    setSavingConfig(true);
-    const { error } = await supabase.from('bots').update({ config: editedConfig }).eq('id', editingBot.id);
-    if (!error) {
-        setBots(prev => prev.map(b => b.id === editingBot.id ? { ...b, config: editedConfig } : b));
-        showToast('✅ Mensagens do bot salvas!');
-        setEditingBot(null);
-    } else {
-        showToast('❌ Erro ao salvar configurações.');
-    }
-    setSavingConfig(false);
-  }
-
   const getStatusColor = (bot: Bot, isRunning: boolean) => {
     if (!isRunning) return 'text-slate-500 bg-slate-950/50 border-slate-800';
     

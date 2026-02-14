@@ -1,0 +1,4 @@
+
+ALTER TABLE public.promo_codes ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+ALTER TABLE public.promo_codes ADD COLUMN IF NOT EXISTS used_count INTEGER DEFAULT 0;
+ALTER TABLE public.promo_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;

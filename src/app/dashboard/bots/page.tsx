@@ -1,7 +1,7 @@
+
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { createClient } from '@supabase/supabase-js';
 import { 
   Bot as BotIcon, 
   Plus, 
@@ -26,14 +26,8 @@ import {
   MessageSquare,
   Tag,
   Image as ImageIcon,
-  ChevronRight,
-  Settings2,
   DollarSign
 } from 'lucide-react';
-
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
 
 type Bot = {
   id: string;
@@ -52,7 +46,7 @@ type Bot = {
 type BotLog = {
   id: string;
   message: string;
-  type: string;
+  level: string; // Changed from 'type' to matches prisma schema (or map it)
   created_at: string;
 };
 
@@ -142,20 +136,13 @@ export default function BotsPage() {
 
   async function loadBots() {
     setLoading(true);
-    const { data: botsData } = await supabase.from('bots').select('*').order('created_at', { ascending: false });
-    
-    // Auto-repair: If any bot is an orphan (no owner_id), try to claim it
-    const orphans = botsData?.filter(b => !b.owner_id) || [];
-    if (orphans.length > 0) {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-            for (const bot of orphans) {
-               await supabase.from('bots').update({ owner_id: user.id }).eq('id', bot.id);
-            }
-        }
+    try {
+        const res = await fetch('/api/bots');
+        const data = await res.json();
+        setBots(Array.isArray(data) ? data : []);
+    } catch(e) {
+        console.error('Failed to load bots', e);
     }
-
-    setBots(botsData || []);
     setLoading(false);
   }
 
@@ -169,18 +156,14 @@ export default function BotsPage() {
 
   const loadLogs = useCallback(async (botId: string) => {
     setLoadingLogs(true);
-    const { data, error } = await supabase
-        .from('bot_logs')
-        .select('*')
-        .eq('bot_id', botId)
-        .order('created_at', { ascending: false })
-        .limit(20);
-    
-    if (error) {
+    try {
+        const res = await fetch(`/api/bots/logs?botId=${botId}`);
+        const data = await res.json();
+        setLogs(prev => ({ ...prev, [botId]: Array.isArray(data) ? data : [] }));
+    } catch (error) {
         console.error('[LOGS] Fetch error:', error);
         showToast('Erro ao carregar logs.');
     }
-    setLogs(prev => ({ ...prev, [botId]: data || [] }));
     setLoadingLogs(false);
   }, []);
 
@@ -199,30 +182,42 @@ export default function BotsPage() {
     if (!newName || !newToken) return;
     setAdding(true);
     
-    const { data: { user } } = await supabase.auth.getUser();
-
-    await supabase.from('bots').insert({ 
-        name: newName, 
-        token: newToken, 
-        status: 'inactive',
-        allowed_groups: [],
-        owner_id: user?.id
-    });
-    setNewName(''); setNewToken('');
+    try {
+        const res = await fetch('/api/bots', {
+            method: 'POST',
+            body: JSON.stringify({ name: newName, token: newToken }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (res.ok) {
+            setNewName(''); setNewToken('');
+            showToast('Bot adicionado!');
+            loadBots();
+        } else {
+            const err = await res.json();
+            showToast(`Erro: ${err.error}`);
+        }
+    } catch(e: any) {
+        showToast(`Erro: ${e.message}`);
+    }
     setAdding(false);
-    showToast('Bot adicionado!');
-    loadBots();
   }
 
   async function deleteBot(id: string) {
     if (!confirm('Tem certeza? Isso removerá todos os logs e ordens vinculadas.')) return;
+    
     if (runningBots.includes(id)) {
       await controlBot(id, 'stop');
     }
-    await supabase.from('bots').delete().eq('id', id);
-    showToast('Bot removido.');
-    loadBots();
-    loadRunning();
+
+    try {
+        await fetch(`/api/bots?id=${id}`, { method: 'DELETE' });
+        showToast('Bot removido.');
+        loadBots();
+        loadRunning();
+    } catch (e: any) {
+        showToast(`Erro: ${e.message}`);
+    }
   }
 
   async function controlBot(id: string, action: 'start' | 'stop') {
@@ -269,10 +264,21 @@ export default function BotsPage() {
   }
 
   async function updateBotSetting(id: string, field: keyof Bot, value: any) {
-    const { error } = await supabase.from('bots').update({ [field]: value }).eq('id', id);
-    if (!error) {
-        setBots(prev => prev.map(b => b.id === id ? { ...b, [field]: value } : b));
-        showToast('Configuração salva!');
+    try {
+        const res = await fetch('/api/bots', {
+            method: 'PUT',
+            body: JSON.stringify({ id, [field]: value }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (res.ok) {
+            setBots(prev => prev.map(b => b.id === id ? { ...b, [field]: value } : b));
+            showToast('Configuração salva!');
+        } else {
+            showToast('Erro ao salvar.');
+        }
+    } catch(e) {
+        showToast('Erro de conexão.');
     }
   }
 
@@ -284,13 +290,23 @@ export default function BotsPage() {
   async function saveBotConfig() {
     if (!editingBot) return;
     setSavingConfig(true);
-    const { error } = await supabase.from('bots').update({ config: editedConfig }).eq('id', editingBot.id);
-    if (!error) {
-        setBots(prev => prev.map(b => b.id === editingBot.id ? { ...b, config: editedConfig } : b));
-        showToast('✅ Mensagens do bot salvas!');
-        setEditingBot(null);
-    } else {
-        showToast('❌ Erro ao salvar configurações.');
+    
+    try {
+        const res = await fetch('/api/bots', {
+            method: 'PUT',
+            body: JSON.stringify({ id: editingBot.id, config: editedConfig }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (res.ok) {
+            setBots(prev => prev.map(b => b.id === editingBot.id ? { ...b, config: editedConfig } : b));
+            showToast('✅ Mensagens do bot salvas!');
+            setEditingBot(null);
+        } else {
+            showToast('❌ Erro ao salvar configurações.');
+        }
+    } catch(e) {
+        showToast('❌ Erro de conexão.');
     }
     setSavingConfig(false);
   }
@@ -539,9 +555,9 @@ export default function BotsPage() {
                                                 <div key={log.id} className="flex gap-2 group">
                                                     <span className="text-slate-600 shrink-0">[{new Date(log.created_at).toLocaleTimeString()}]</span>
                                                     <span className={
-                                                        log.type === 'error' ? 'text-red-400' :
-                                                        log.type === 'success' ? 'text-green-400' :
-                                                        log.type === 'warning' ? 'text-yellow-400' :
+                                                        log.level === 'error' ? 'text-red-400' :
+                                                        log.level === 'success' ? 'text-green-400' :
+                                                        log.level === 'warning' ? 'text-yellow-400' :
                                                         'text-blue-300'
                                                     }>
                                                         {log.message}

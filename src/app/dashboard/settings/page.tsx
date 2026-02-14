@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+// import { createClient } from '@supabase/supabase-js'; (Removed)
 import { 
   Gamepad2, 
   CreditCard, 
@@ -18,12 +18,11 @@ import {
   EyeOff, 
   DollarSign, 
   Wallet,
-  Coins
+  Coins,
+  AlertTriangle
 } from 'lucide-react';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Imports removed
 
 type Setting = { key: string; value: string; label: string; category: string };
 type PromoCode = { code: string; discount_amount: number; is_active: boolean };
@@ -46,11 +45,22 @@ export default function SettingsPage() {
 
   async function loadData() {
     setLoading(true);
-    const { data: settingsData } = await supabase.from('settings').select('*').order('category');
-    setSettings(settingsData || []);
-    const values: Record<string, string> = {};
-    settingsData?.forEach((s: Setting) => { values[s.key] = s.value; });
-    setEditedValues(values);
+    try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        
+        const settingsArray = Object.entries(data).map(([key, value]) => ({ 
+            key, 
+            value: value as string,
+            label: key, 
+            category: 'general' 
+        }));
+
+        setSettings(settingsArray);
+        setEditedValues(data);
+    } catch (e) {
+        console.error(e);
+    }
     setLoading(false);
   }
 
@@ -64,11 +74,21 @@ export default function SettingsPage() {
 
   async function saveSettings() {
     setSaving(true);
-    const updates = Object.entries(editedValues).map(([key, value]) =>
-      supabase.from('settings').upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' })
-    );
-    await Promise.all(updates);
-    showToast('Configurações salvas!');
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'POST',
+            body: JSON.stringify(editedValues),
+            headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (res.ok) {
+            showToast('Configurações salvas!');
+        } else {
+            showToast('Erro ao salvar.');
+        }
+    } catch(e) {
+        showToast('Erro de conexão.');
+    }
     setSaving(false);
   }
 

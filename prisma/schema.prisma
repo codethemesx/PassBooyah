@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Settings {
+  key   String @id
+  value String
+  // Para manter compatibilidade com o formato do Supabase (embora lá fosse chave composta ou simples)
+  // Assumindo que 'key' é única.
+}
+
+model PromoCode {
+  code            String    @id
+  discount_amount Float
+  is_active       Boolean   @default(true)
+  max_uses        Int?
+  used_count      Int       @default(0)
+  expires_at      DateTime?
+}
+
+model Bot {
+  id             String   @id @default(uuid())
+  user_id        String   // ID do usuário no Supabase Auth
+  token          String
+  name           String?
+  username       String?
+  type           String   @default("sales") // sales, support
+  status         String   @default("inactive") // active, inactive
+  use_webhooks   Boolean  @default(false)
+  webhook_url    String?
+  allowed_groups Json?    // Array of strings
+  config         Json?
+  last_seen      DateTime?
+  created_at     DateTime @default(now())
+}
+
+model BotLog {
+  id         String   @id @default(uuid())
+  bot_id     String
+  level      String
+  message    String
+  details    Json?
+  created_at DateTime @default(now())
+
+  // Relação opcional se quisermos linkar com Bot
+  // bot Bot @relation(fields: [botId], references: [id])
+}
+
+model Order {
+  id              String   @id @default(uuid())
+  user_id         String?  // ID do usuário no Supabase Auth (opcional se venda for anonima)
+  status          String
+  amount          Float
+  payment_method  String?
+  transaction_id  String?  @unique
+  customer_email  String?
+  customer_phone  String?
+  items           Json?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+}
+
+// Para manter estado das conversas do Telegraf
+model BotSession {
+  key     String @id
+  session Json
+}
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String?
+  role      String   @default("admin")
+  created_at DateTime @default(now())
+}

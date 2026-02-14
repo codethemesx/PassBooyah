@@ -1,12 +1,8 @@
+
 import { Telegraf, Markup, Context } from 'telegraf';
-import { createClient } from '@supabase/supabase-js';
+import { prisma } from './db';
 import * as MercadoPago from './mercadopago';
 import * as LikesFF from './likesff';
-
-// Supabase client (server-side with service role)
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
 
 // In-memory store for running bots
 const runningBots = new Map<string, Telegraf>();
@@ -24,25 +20,34 @@ const HEARTBEAT_THROTTLE = 300000; // 5 minutes
 async function addLog(botId: string, userId: string | number | undefined, chatId: string | number | undefined, message: string, type: string = 'info') {
   try {
     // Non-blocking log insertion
-    supabase.from('bot_logs').insert({
-      bot_id: botId,
-      user_id: userId?.toString(),
-      chat_id: chatId?.toString(),
-      message,
-      type
-    }).then(({ error }) => { if (error) console.error('[DB-LOG] Error:', error); });
-  } catch (e) {
+    prisma.botLog.create({
+      data: {
+        bot_id: botId,
+        user_id: userId?.toString(),
+        chat_id: chatId?.toString(),
+        message,
+        level: type // Mapped type to level matches schema
+      }
+    }).catch((e: any) => console.error('[DB-LOG] Error:', e));
+  } catch (e: any) {
     console.error('[DB-LOG] Critical:', e);
   }
 }
 
 async function getSession(userId: number) {
-  const { data } = await supabase.from('bots_sessions').select('*').eq('user_id', userId).single();
-  return data || { step: 'START' };
+  const session = await prisma.botSession.findUnique({ where: { key: userId.toString() } });
+  return session?.session ? (session.session as any) : { step: 'START' };
 }
 
 async function updateSession(userId: number, update: any) {
-  await supabase.from('bots_sessions').upsert({ user_id: userId, ...update, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+  const current = await getSession(userId);
+  const nextSession = { ...current, ...update, updated_at: new Date().toISOString() };
+  
+  await prisma.botSession.upsert({
+      where: { key: userId.toString() },
+      create: { key: userId.toString(), session: nextSession },
+      update: { session: nextSession }
+  });
 }
 
 async function s(botId: string, key: string, fallback: string = ''): Promise<string> {
@@ -51,7 +56,10 @@ async function s(botId: string, key: string, fallback: string = ''): Promise<str
   // 1. Get/Cache Bot Config
   let botData = botConfigCache.get(botId);
   if (!botData || (now - botData.timestamp > CACHE_TTL)) {
-      const { data } = await supabase.from('bots').select('id, config, is_private, allowed_groups').eq('id', botId).single();
+      const data = await prisma.bot.findUnique({ 
+          where: { id: botId },
+          select: { id: true, config: true, allowed_groups: true, type: true }
+      });
       if (data) {
           botData = { data, timestamp: now };
           botConfigCache.set(botId, botData);
@@ -59,7 +67,7 @@ async function s(botId: string, key: string, fallback: string = ''): Promise<str
   }
 
   // 2. Check Bot Level Setting
-  const botConfig = botData?.data?.config || {};
+  const botConfig = (botData?.data?.config as any) || {};
   if (botConfig[key]) {
       return botConfig[key];
   }
@@ -71,14 +79,12 @@ async function s(botId: string, key: string, fallback: string = ''): Promise<str
   }
 
   // 4. Fallback to Global Settings DB
-  const { data: globalData } = await supabase.from('settings').select('value').eq('key', key).single();
+  const globalData = await prisma.settings.findUnique({ where: { key: key } });
   const value = globalData?.value || fallback;
   
   settingsCache.set(key, { value, timestamp: now });
   return value;
 }
-
-// ... other helpers ...
 
 async function sendStep(ctx: Context, botId: string, imageKey: string, textKey: string, textFallback: string, displayModeKey?: string, extra?: any) {
   const [imageUrl, text, displayMode] = await Promise.all([
@@ -113,25 +119,30 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
     const lastSignal = lastHeartbeat.get(botId) || 0;
     if (now - lastSignal > HEARTBEAT_THROTTLE) {
         lastHeartbeat.set(botId, now);
-        supabase.from('bots').update({ last_seen: new Date().toISOString() }).eq('id', botId).then();
+        prisma.bot.update({ 
+            where: { id: botId },
+            data: { last_seen: new Date() }
+        }).catch(() => {});
     }
 
     // 2. Cached Bot Config for Privacy Check
     let botData = botConfigCache.get(botId);
     if (!botData || (now - botData.timestamp > CACHE_TTL)) {
-        const { data } = await supabase.from('bots').select('*').eq('id', botId).single();
+        const data = await prisma.bot.findUnique({ where: { id: botId } });
         if (data) {
             botData = { data, timestamp: now };
             botConfigCache.set(botId, botData);
         }
     }
 
-    if (botData?.data?.is_private) {
-        const allowed = botData.data.allowed_groups || [];
+    const allowed = (botData?.data?.allowed_groups as any) || [];
+    
+    // Check if it's an array and has items (simple check for "is restricted")
+    if (Array.isArray(allowed) && allowed.length > 0) {
         const chatId = ctx.chat?.id.toString();
         
         if (ctx.chat?.type === 'private' || (chatId && !allowed.includes(chatId))) {
-            return;
+             return;
         }
     }
     
@@ -182,18 +193,38 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
     if (session.step === STEPS.WAITING_PROMO) {
       const code = text.toUpperCase();
       addLog(botId, userId, ctx.chat?.id, `Código promo usado: ${code}`, 'info');
-      const { data: promo } = await supabase
-        .from('promo_codes').select('*').eq('code', code).eq('is_active', true).single();
+      
+      const promo = await prisma.promoCode.findFirst({
+          where: { 
+              code: code, 
+              is_active: true 
+          }
+      });
+      
       const basePrice = parseFloat(await s(botId, 'pass_price', '8.00'));
 
-      if (promo) {
+      // Validate expiration logic
+      let isValid = !!promo;
+      if (isValid && promo) {
+          if (promo.expires_at && new Date() > promo.expires_at) isValid = false;
+          if (promo.max_uses && promo.max_uses > 0 && promo.used_count >= promo.max_uses) isValid = false;
+      }
+
+      if (isValid && promo) {
         const discount = promo.discount_amount || 0;
         const finalPrice = Math.max(0, basePrice - discount);
+        
+        // Increment usage
+        await prisma.promoCode.update({
+            where: { code: promo.code },
+            data: { used_count: { increment: 1 } }
+        });
+
         addLog(botId, userId, ctx.chat?.id, `Promo validada! Preço: ${finalPrice}`, 'success');
         await ctx.reply(`✅ Código ${code} aplicado! Desconto de R$ ${discount.toFixed(2)}.`);
         await generatePayment(ctx, finalPrice, session.ff_id, botId);
       } else {
-        addLog(botId, userId, ctx.chat?.id, `Promo inválida: ${code}`, 'warning');
+        addLog(botId, userId, ctx.chat?.id, `Promo inválida/expirada: ${code}`, 'warning');
         const btnRetry = await s(botId, 'btn_retry_promo', '🔄 Tentar Novamente');
         const btnNo = await s(botId, 'btn_no_promo', '➡️ Sem Desconto');
         await ctx.reply('Código inválido ou expirado.', Markup.inlineKeyboard([
@@ -256,15 +287,14 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
       let txId = session.tx_id;
       
       if (!txId) {
-          const { data: order } = await supabase
-            .from('orders')
-            .select('*')
-            .eq('customer_id', ctx.from.id.toString())
-            .eq('status', 'pending')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .single();
-          if (order) txId = order.external_id;
+          const order = await prisma.order.findFirst({
+             where: {
+                 user_id: ctx.from.id.toString(),
+                 status: 'pending'
+             },
+             orderBy: { created_at: 'desc' }
+          });
+          if (order) txId = order.transaction_id || order.id; 
       }
 
       if (!txId) return ctx.reply('⚠️ Nenhuma transação pendente encontrada.');
@@ -273,7 +303,9 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
 
       if (status.paid) {
           addLog(botId, ctx.from.id, ctx.chat?.id, `Pagamento identificado via botão! TX: ${txId}`, 'success');
-          const { data: currentOrder } = await supabase.from('orders').select('status').eq('external_id', txId).single();
+          
+          const currentOrder = await prisma.order.findUnique({ where: { transaction_id: txId } });
+          
           if (currentOrder?.status === 'delivered' || currentOrder?.status === 'paid') {
               try { await ctx.deleteMessage(); } catch(e) {}
               return;
@@ -282,15 +314,18 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
           try { await ctx.deleteMessage(); } catch(e) {}
           const statusMsg = await ctx.reply('⌛ Pagamento confirmado! <b>Enviando passe booyah!...</b>', { parse_mode: 'HTML' });
           
-          await supabase.from('orders')
-            .update({ status: 'paid', updated_at: new Date().toISOString() })
-            .eq('external_id', txId);
+          await prisma.order.update({
+              where: { id: currentOrder?.id },
+              data: { status: 'paid', updated_at: new Date() }
+          });
 
+          // Delivery Logic
           try {
              let ffId = session.ff_id;
-             if (!ffId) {
-                 const { data: order } = await supabase.from('orders').select('metadata').eq('external_id', txId).single();
-                 ffId = order?.metadata?.ff_id;
+             let metadata: any = currentOrder?.items;
+             
+             if (!ffId && metadata) {
+                 ffId = metadata.ff_id;
              }
 
              if (!ffId) throw new Error('FF ID not found');
@@ -301,18 +336,19 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
                  const nick = likesResponse.nick || likesResponse.nickname || 'Jogador';
                  addLog(botId, ctx.from.id, ctx.chat?.id, `Passe enviado com sucesso para ${nick} (${ffId})`, 'success');
                  
-                 await supabase.from('orders')
-                    .update({ 
-                        status: 'delivered', 
-                        customer_name: nick,
-                        metadata: { 
-                            ...session.metadata,
-                            ff_id: ffId, 
-                            likesff_response: likesResponse,
-                            delivery_time: new Date().toISOString()
-                        } 
-                    })
-                    .eq('external_id', txId);
+                 await prisma.order.update({
+                     where: { id: currentOrder?.id },
+                     data: {
+                         status: 'delivered',
+                         customer_email: nick, 
+                         items: { 
+                             ...(metadata as object),
+                             ff_id: ffId, 
+                             likesff_response: likesResponse,
+                             delivery_time: new Date().toISOString()
+                         } 
+                     }
+                 });
 
                  await ctx.telegram.editMessageText(ctx.chat?.id, statusMsg.message_id, undefined, `✅ <b>Passe Booyah! Enviado!</b>\n\nJogador: <b>${nick}</b>\nID: <code>${ffId}</code>\n\n<i>Lembre-se: Cada conta Free Fire só pode receber 1 passe por mês.</i>`, { parse_mode: 'HTML' });
                  await updateSession(ctx.from.id, { step: 'COMPLETED' });
@@ -349,16 +385,21 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
 
       addLog(botId, ctx.from.id, ctx.chat?.id, `Gerado Pix de R$ ${amount.toFixed(2)} para ID FF: ${ff_id}`, 'info');
 
-      const { data: order } = await supabase.from('orders').insert({
-        bot_id: botId,
-        customer_id: ctx.from.id.toString(),
-        customer_name: customer.name,
-        amount,
-        status: 'pending',
-        external_id: pixData.id,
-        product_type: 'passbooya',
-        metadata: { ff_id },
-      }).select().single();
+      // Create Order
+      const order = await prisma.order.create({
+          data: {
+              user_id: ctx.from.id.toString(),
+              amount: amount,
+              status: 'pending',
+              transaction_id: pixData.id.toString(),
+              payment_method: 'pix',
+              items: {
+                  bot_id: botId,
+                  ff_id: ff_id,
+                  customer_name: customer.name
+              }
+          }
+      });
 
       await updateSession(ctx.from.id, { step: 'PAYMENT_PENDING', pix_code: pixCode, tx_id: pixData.id });
 
@@ -375,19 +416,18 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
       }
 
       if (order && paymentMsg) {
-        await supabase.from('orders').update({ metadata: { ...order.metadata, payment_message_id: paymentMsg.message_id, chat_id: ctx.chat?.id } }).eq('id', order.id);
+         // Update metadata with message_id
+         const newMeta = { ...(order.items as object), payment_message_id: paymentMsg.message_id, chat_id: ctx.chat?.id };
+         await prisma.order.update({
+             where: { id: order.id },
+             data: { items: newMeta }
+         });
       }
     } catch (e: any) {
       const errorMsg = e.message || String(e);
       console.error(`[BOT-ERR] Falha ao gerar Pix:`, errorMsg);
-      
       addLog(botId, ctx.from?.id, ctx.chat?.id, `Erro ao gerar pagamento: ${errorMsg}`, 'error');
-      
-      // Notify user with the log as requested
       await ctx.reply(`❌ <b>Erro na Geração do Pix</b>\n\n<code>${errorMsg}</code>\n\nO erro foi registrado e o suporte foi avisado.`, { parse_mode: 'HTML' });
-      
-      // If there's a specific bot owner or support group, we could notify them here.
-      // For now, sending directly in the chat helps the user debug immediately.
     }
   }
 }
@@ -397,8 +437,8 @@ export function setupBotLogic(bot: Telegraf, botId: string) {
 export async function isRunning(botId: string): Promise<boolean> {
   if (runningBots.has(botId)) return true;
   
-  const { data } = await supabase.from('bots').select('use_webhooks, status').eq('id', botId).single();
-  return !!(data?.use_webhooks && data?.status === 'active');
+  const bot = await prisma.bot.findUnique({ where: { id: botId } });
+  return !!(bot?.use_webhooks && bot?.status === 'active');
 }
 
 export function getRunningBots(): string[] {
@@ -416,8 +456,7 @@ export async function startBot(botId: string, token: string): Promise<{ success:
     const bot = new Telegraf(token);
     setupBotLogic(bot, botId);
 
-    // Update status in DB first to ensures webhook/polling choice
-    const { data: botInfo } = await supabase.from('bots').select('*').eq('id', botId).single();
+    const botInfo = await prisma.bot.findUnique({ where: { id: botId } });
 
     if (botInfo?.use_webhooks && botInfo?.webhook_url) {
         await bot.telegram.setWebhook(botInfo.webhook_url);
@@ -429,7 +468,11 @@ export async function startBot(botId: string, token: string): Promise<{ success:
     }
 
     runningBots.set(botId, bot);
-    await supabase.from('bots').update({ status: 'active', last_seen: new Date().toISOString() }).eq('id', botId);
+    
+    await prisma.bot.update({
+        where: { id: botId },
+        data: { status: 'active', last_seen: new Date() }
+    });
     
     addLog(botId, undefined, undefined, `Bot iniciado (Modo: ${botInfo?.use_webhooks ? 'Webhook' : 'Polling'})`, 'success');
     return { success: true };
@@ -442,7 +485,7 @@ export async function startBot(botId: string, token: string): Promise<{ success:
 export async function stopBot(botId: string): Promise<{ success: boolean; error?: string }> {
   try {
     console.log(`[STOP] Parando bot ${botId}...`);
-    const { data: botInfo } = await supabase.from('bots').select('*').eq('id', botId).single();
+    const botInfo = await prisma.bot.findUnique({ where: { id: botId } });
     
     if (!botInfo) return { success: false, error: 'Bot não encontrado no banco.' };
 
@@ -467,8 +510,10 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
     }
 
     // 3. Update Status and Log
-    const { error: updateError } = await supabase.from('bots').update({ status: 'inactive' }).eq('id', botId);
-    if (updateError) throw updateError;
+    await prisma.bot.update({
+        where: { id: botId },
+        data: { status: 'inactive' }
+    });
     
     await addLog(botId, undefined, undefined, `Bot parado pelo painel`, 'warning');
 
@@ -483,10 +528,9 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
 export async function syncBots() {
   console.log('🔄 Sincronizando bots ativos...');
   try {
-    const { data: activeBots } = await supabase
-      .from('bots')
-      .select('*')
-      .eq('status', 'active');
+    const activeBots = await prisma.bot.findMany({
+        where: { status: 'active' }
+    });
 
     if (!activeBots) return { success: true, restarted: 0 };
 
@@ -519,36 +563,38 @@ if (typeof process !== 'undefined') {
 export async function notifyPaymentProcessed(txId: string) {
   console.log(`[NOTIFY] 🚀 Iniciando entrega para TX: ${txId}`);
   try {
-    const { data: order, error: orderErr } = await supabase
-      .from('orders')
-      .select('*, bots(token, id)')
-      .eq('external_id', txId)
-      .maybeSingle();
-
-    if (orderErr) {
-      console.error('[NOTIFY] ❌ Erro ao buscar ordem no Supabase:', orderErr);
-      return;
-    }
+    const order = await prisma.order.findUnique({
+      where: { transaction_id: txId } // Requires @unique on transaction_id
+    });
     
     if (!order) {
       console.error('[NOTIFY] ❌ Ordem não encontrada para transação:', txId);
       return;
     }
 
-    const botToken = (order.bots as any)?.token;
-    const botId = (order.bots as any)?.id;
-    
+    let botToken, botId;
+    const orderItems: any = order.items || {};
+
+    // Get Bot ID from metadata/items (we stored it there)
+    botId = orderItems.bot_id; 
+
+    if (botId) {
+        const bot = await prisma.bot.findUnique({ where: { id: botId } });
+        botToken = bot?.token;
+    }
+
     if (!botToken || !botId) {
       console.error('[NOTIFY] ❌ Bot ou Token não encontrados para a ordem:', order.id);
       return;
     }
 
     console.log(`[NOTIFY] 🤖 Bot identificado: ${botId}. Registrando log de início...`);
-    await addLog(botId, order.customer_id, undefined, `Pagamento identificado (TX: ${txId}). Processando entrega...`, 'success');
+    await addLog(botId, order.user_id, undefined, `Pagamento identificado (TX: ${txId}). Processando entrega...`, 'success');
 
     const bot = new Telegraf(botToken);
-    const chatId = order.metadata?.chat_id || order.customer_id;
-    const paymentMsgId = order.metadata?.payment_message_id;
+    
+    const chatId = orderItems.chat_id || order.user_id;
+    const paymentMsgId = orderItems.payment_message_id;
 
     // Tentar apagar a mensagem com o QR Code
     if (paymentMsgId) {
@@ -564,22 +610,25 @@ export async function notifyPaymentProcessed(txId: string) {
     console.log(`[NOTIFY] 💬 Enviando aviso de "Enviando Passe" para chat ${chatId}...`);
     const statusMsg = await bot.telegram.sendMessage(chatId, '⌛ <b>Pagamento confirmado!</b>\nEstamos enviando o seu passe agora mesmo...', { parse_mode: 'HTML' });
 
-    const { sendPass } = await import('./likesff');
-    const ffId = order.metadata?.ff_id;
+    // LikesFF logic
+    // We already do this in check_payment, but webhook might trigger this separately
+    // If order is already Delivered, stop
+    if (order.status === 'delivered') return;
+
+    const ffId = orderItems.ff_id;
     
     if (!ffId) {
       console.error('[NOTIFY] ❌ ID FF não encontrado na metadata da ordem!');
-      await addLog(botId, order.customer_id, chatId, `Erro: ID FF não encontrado na ordem`, 'error');
+      await addLog(botId, order.user_id, chatId, `Erro: ID FF não encontrado na ordem`, 'error');
       await bot.telegram.editMessageText(chatId, statusMsg.message_id, undefined, '⚠️ <b>Erro:</b> Seu ID Free Fire não foi encontrado nos dados do pedido. Entre em contato com o suporte.');
       return;
     }
 
     try {
       console.log(`[NOTIFY] 🌐 Chamando API LikesFF para ID: ${ffId}...`);
-      const likesResponse = await sendPass(ffId);
+      const likesResponse = await LikesFF.sendPass(ffId);
       console.log('[NOTIFY] 📥 Resposta LikesFF:', JSON.stringify(likesResponse));
 
-      // Verificar sucesso (LikesFF costuma retornar error: false ou status: success)
       const isSuccess = likesResponse.error === false || 
                         likesResponse.status === 'success' || 
                         likesResponse.msg?.toLowerCase().includes('sucesso') ||
@@ -589,26 +638,29 @@ export async function notifyPaymentProcessed(txId: string) {
         const nick = likesResponse.nick || likesResponse.nickname || likesResponse.data?.nick || 'Jogador';
         console.log(`[NOTIFY] ✅ Entrega confirmada para: ${nick}`);
         
-        await addLog(botId, order.customer_id, chatId, `Passe enviado com sucesso para ${nick} (ID: ${ffId})`, 'success');
+        await addLog(botId, order.user_id, chatId, `Passe enviado com sucesso para ${nick} (ID: ${ffId})`, 'success');
         
         // Atualizar status final no banco
-        await supabase.from('orders').update({ 
-          status: 'delivered', 
-          customer_name: nick, 
-          metadata: { ...order.metadata, likesff_response: likesResponse, delivery_time: new Date().toISOString() } 
-        }).eq('id', order.id);
+        await prisma.order.update({ 
+          where: { id: order.id },
+          data: { 
+            status: 'delivered', 
+            customer_email: nick, // Store Nick
+            items: { ...orderItems, likesff_response: likesResponse, delivery_time: new Date().toISOString() } 
+          }
+        });
 
         await bot.telegram.editMessageText(chatId, statusMsg.message_id, undefined, `✅ <b>Passe Booyah! Enviado!</b>\n\nJogador: <b>${nick}</b>\nID: <code>${ffId}</code>\n\nObrigado pela compra!`, { parse_mode: 'HTML' });
       } else {
         const errMsg = likesResponse.msg || likesResponse.message || 'Erro desconhecido na API de entrega.';
         console.error('[NOTIFY] ❌ Falha informada pela LikesFF:', errMsg);
         
-        await addLog(botId, order.customer_id, chatId, `Falha na entrega: ${errMsg}`, 'error');
+        await addLog(botId, order.user_id, chatId, `Falha na entrega: ${errMsg}`, 'error');
         await bot.telegram.editMessageText(chatId, statusMsg.message_id, undefined, `⚠️ <b>Ops! Ocorreu um problema no envio.</b>\n\nMotivo: ${errMsg}\n\nO suporte já foi avisado e processará seu envio manualmente.`, { parse_mode: 'HTML' });
       }
     } catch (e: any) {
       console.error('[NOTIFY] ❌ Erro técnico ao chamar LikesFF:', e.message);
-      await addLog(botId, order.customer_id, chatId, `Erro técnico LikesFF: ${e.message}`, 'error');
+      await addLog(botId, order.user_id, chatId, `Erro técnico LikesFF: ${e.message}`, 'error');
       await bot.telegram.editMessageText(chatId, statusMsg.message_id, undefined, `⚠️ <b>Erro técnico no processamento.</b>\nSeu pagamento foi confirmado, mas o sistema de envio automático falhou. O suporte fará a entrega manual brevemente.`);
     }
   } catch (error: any) {

@@ -1,11 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/db';
 import { notifyPaymentProcessed } from '@/lib/bot-manager';
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 export async function POST(req: NextRequest) {
   try {
@@ -18,7 +13,7 @@ export async function POST(req: NextRequest) {
       console.log(`[MP-WEBHOOK] Notificação de pagamento recebida: ${id}`);
       
       // Get Access Token from settings
-      const { data: setting } = await supabase.from('settings').select('value').eq('key', 'mercadopago_access_token').single();
+      const setting = await prisma.settings.findUnique({ where: { key: 'mercadopago_access_token' } });
       const accessToken = setting?.value;
 
       if (!accessToken) throw new Error('MP Access Token not configured');
@@ -34,20 +29,22 @@ export async function POST(req: NextRequest) {
       
       if (payment.status === 'approved') {
         const externalId = payment.id.toString();
+        // O transaction_id do nosso banco deve bater com o ID do pagamento do MP
         console.log(`[MP-WEBHOOK] ✅ Pagamento ${externalId} APROVADO!`);
 
         // Update database and trigger delivery
-        const { data: order } = await supabase
-          .from('orders')
-          .select('id, status')
-          .eq('external_id', externalId)
-          .maybeSingle();
+        const order = await prisma.order.findUnique({
+             where: { transaction_id: externalId }
+        });
 
         if (order && order.status === 'pending') {
-          await supabase.from('orders').update({ 
-            status: 'paid', 
-            updated_at: new Date().toISOString() 
-          }).eq('id', order.id);
+          await prisma.order.update({
+            where: { id: order.id },
+            data: { 
+                status: 'paid', // Bot manager change to 'delivered' afterwards
+                updated_at: new Date()
+            }
+          });
 
           // Trigger bot delivery
           await notifyPaymentProcessed(externalId);

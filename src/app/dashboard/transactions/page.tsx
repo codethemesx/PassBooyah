@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useMemo } from 'react';
-import { createClient } from '@supabase/supabase-js';
+// import { createClient } from '@supabase/supabase-js'; (Removed)
 import { 
   Search, 
   ChevronDown, 
@@ -19,9 +19,7 @@ import {
   Tag
 } from 'lucide-react';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Imports removed
 
 export default function TransactionsPage() {
   const [orders, setOrders] = useState<any[]>([]);
@@ -37,18 +35,19 @@ export default function TransactionsPage() {
 
   async function loadData() {
     setLoading(true);
-    const [ordersRes, settingsRes] = await Promise.all([
-      supabase.from('orders').select('*').order('created_at', { ascending: false }),
-      supabase.from('settings').select('key, value').in('key', ['pass_cost', 'pix_fee_percent'])
-    ]);
-    
-    setOrders(ordersRes.data || []);
-    
-    const costSetting = settingsRes.data?.find(s => s.key === 'pass_cost');
-    const feeSetting = settingsRes.data?.find(s => s.key === 'pix_fee_percent');
-    
-    setPassCost(parseFloat(costSetting?.value || '4.50')); // Fallback to 4.50 as requested
-    setPixFeePercent(parseFloat(feeSetting?.value || '1.33'));
+    try {
+        const [ordersRes, settingsRes] = await Promise.all([
+          fetch('/api/transactions').then(res => res.json()),
+          fetch('/api/settings').then(res => res.json())
+        ]);
+        
+        setOrders(Array.isArray(ordersRes) ? ordersRes : []);
+        
+        setPassCost(parseFloat(settingsRes['pass_cost'] || '4.50'));
+        setPixFeePercent(parseFloat(settingsRes['pix_fee_percent'] || '1.33'));
+    } catch (e) {
+        console.error(e);
+    }
     setLoading(false);
   }
 

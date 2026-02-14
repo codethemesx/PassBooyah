@@ -1,11 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { prisma } from '@/lib/db';
 import { notifyPaymentProcessed } from '@/lib/bot-manager';
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 export async function POST(req: NextRequest) {
   try {
@@ -16,13 +11,11 @@ export async function POST(req: NextRequest) {
     }
 
     // 1. Get order
-    const { data: order, error: orderErr } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('id', orderId)
-        .single();
+    const order = await prisma.order.findUnique({
+        where: { id: orderId }
+    });
     
-    if (orderErr || !order) {
+    if (!order) {
         return NextResponse.json({ error: 'Pedido não encontrado' }, { status: 404 });
     }
 
@@ -31,16 +24,14 @@ export async function POST(req: NextRequest) {
     }
 
     // 2. Update status to paid if it was pending
-    const { error: updateErr } = await supabase
-        .from('orders')
-        .update({ status: 'paid', updated_at: new Date().toISOString() })
-        .eq('id', orderId);
-
-    if (updateErr) throw updateErr;
+    await prisma.order.update({
+        where: { id: orderId },
+        data: { status: 'paid', updated_at: new Date() }
+    });
 
     // 3. Trigger delivery logic (LikesFF + Telegram msg)
     // notifyPaymentProcessed handles both the status update to 'delivered' and the bot messages
-    await notifyPaymentProcessed(order.external_id);
+    await notifyPaymentProcessed(order.transaction_id || order.id);
 
     return NextResponse.json({ success: true, message: 'Pedido aprovado e entrega disparada!' });
 

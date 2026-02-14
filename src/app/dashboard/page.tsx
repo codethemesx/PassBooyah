@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+// import { createClient } from '@supabase/supabase-js'; (Removed)
 import { 
   TrendingUp, 
   Gamepad2, 
@@ -17,9 +17,7 @@ import {
 } from 'lucide-react';
 import { checkBalance } from '@/lib/likesff';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Imports removed
 
 export default function DashboardPage() {
   const [totalSales, setTotalSales] = useState(0);
@@ -35,19 +33,15 @@ export default function DashboardPage() {
   async function loadData() {
     setLoading(true);
     try {
-      const [salesRes, ordersRes, settingsRes] = await Promise.all([
-        supabase.from('orders').select('amount', { count: 'exact' }).in('status', ['paid', 'delivered']),
-        supabase.from('orders').select('*').order('created_at', { ascending: false }).limit(5),
-        supabase.from('settings').select('key, value').in('key', ['likesff_api_key', 'likesff_email'])
-      ]);
+      const res = await fetch('/api/dashboard/stats');
+      const data = await res.json();
 
-      setTotalSales(salesRes.count || 0);
-      const totalRevenue = (salesRes.data || []).reduce((sum, order) => sum + parseFloat(order.amount), 0);
-      setRevenue(totalRevenue);
-      setRecentOrders(ordersRes.data || []);
+      setTotalSales(data.totalSales || 0);
+      setRevenue(data.revenue || 0);
+      setRecentOrders(data.recentOrders || []);
 
-      const apiKey = settingsRes.data?.find(s => s.key === 'likesff_api_key')?.value;
-      const email = settingsRes.data?.find(s => s.key === 'likesff_email')?.value;
+      const apiKey = data.likesff?.likesff_api_key;
+      const email = data.likesff?.likesff_email;
 
       if (apiKey) {
         const res = await fetch(`/api/likesff/info?key=${apiKey}${email ? `&email=${email}` : ''}`);
